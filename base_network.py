@@ -11,12 +11,15 @@ class NNetwork:
         self.activation = activation
         self.optimizer = optimizer
         self.learning_rate = learning_rate
+        self.num_classes = layers[-1]
         assert self.num_layers > 1, "Network must have at least two layers"
 
+        # Initialize parameters (weights and biases)
         for l in range(1, self.num_layers):
             self.parameters['W' + str(l)] = np.random.randn(layers[l], layers[l - 1]) * 0.01
             self.parameters['b' + str(l)] = np.zeros((layers[l], 1))
 
+        # Adam optimizer initialization
         if optimizer == "adam":
             self.v = {k: np.zeros_like(v) for k, v in self.parameters.items()}
             self.s = {k: np.zeros_like(v) for k, v in self.parameters.items()}
@@ -34,6 +37,11 @@ class NNetwork:
         A = 1 / (1 + np.exp(-Z))
         return A, Z
     
+    def _softmax(self, Z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        exp_Z = np.exp(Z - np.max(Z, axis=0, keepdims=True))  # Stability fix
+        A = exp_Z / np.sum(exp_Z, axis=0, keepdims=True)
+        return A, Z
+    
     def _relu_back(self, dA: np.ndarray, Z: np.ndarray) -> np.ndarray:
         dZ = np.array(dA, copy=True)
         dZ[Z <= 0] = 0
@@ -42,6 +50,9 @@ class NNetwork:
     def _sigmoid_back(self, dA: np.ndarray, Z: np.ndarray) -> np.ndarray:
         s = 1 / (1 + np.exp(-Z))
         return dA * s * (1 - s)
+    
+    def _softmax_back(self, A: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        return A - Y  # Softmax + CE combined gradient
     
     def forward(self, X: np.ndarray) -> np.ndarray:
         self.empty_cache()
@@ -52,7 +63,10 @@ class NNetwork:
             self.Z_cache[f'Z{l}'] = Z
             
             if l == self.num_layers - 1:  # Output layer
-                A, _ = self._sigmoid(Z)
+                if self.num_classes == 1:
+                    A, _ = self._sigmoid(Z)
+                else:
+                    A, _ = self._softmax(Z)
             else:
                 A, _ = self._relu(Z) if self.activation == "relu" else self._sigmoid(Z)
             
@@ -65,22 +79,23 @@ class NNetwork:
         grads = {}
         
         # Output layer
-        dA = - (np.divide(Y, self.A_cache[f'A{self.num_layers-1}']) - 
-                np.divide(1 - Y, 1 - self.A_cache[f'A{self.num_layers-1}']))
-        
+        A_last = self.A_cache[f'A{self.num_layers-1}']
+        if self.num_classes == 1:
+            dA = - (np.divide(Y, A_last) - np.divide(1 - Y, 1 - A_last))
+            dZ = self._sigmoid_back(dA, self.Z_cache[f'Z{self.num_layers-1}'])
+        else:
+            dZ = self._softmax_back(A_last, Y)
+
+        # Backpropagate through the network
         for l in reversed(range(1, self.num_layers)):
-            Z = self.Z_cache[f'Z{l}']
-            if l == self.num_layers - 1:
-                dZ = self._sigmoid_back(dA, Z)
-            else:
-                dZ = self._relu_back(dA, Z) if self.activation == "relu" else self._sigmoid_back(dA, Z)
-            
             A_prev = self.A_cache[f'A{l-1}']
             grads[f'dW{l}'] = np.dot(dZ, A_prev.T) / m
             grads[f'db{l}'] = np.sum(dZ, axis=1, keepdims=True) / m
             
             if l > 1:
                 dA = np.dot(self.parameters[f'W{l}'].T, dZ)
+                Z = self.Z_cache[f'Z{l-1}']
+                dZ = self._relu_back(dA, Z) if self.activation == "relu" else self._sigmoid_back(dA, Z)
 
         return grads
 
@@ -104,11 +119,22 @@ class NNetwork:
                     
                     self.parameters[f'{param}{l}'] -= self.learning_rate * v_corrected / (np.sqrt(s_corrected) + epsilon)
 
-    def __call__(self, X: np.ndarray) -> np.ndarray:
-        return self.predict(X)
-    
+    def calculate_loss(self, Y: np.ndarray, A: np.ndarray) -> float:
+        m = Y.shape[1]
+        if self.num_classes == 1:
+            # Binary Cross-Entropy Loss
+            loss = -np.mean(Y * np.log(A) + (1 - Y) * np.log(1 - A))
+        else:
+            # Categorical Cross-Entropy Loss
+            loss = -np.mean(np.sum(Y * np.log(A), axis=0))
+        return loss
+
     def predict(self, X: np.ndarray) -> np.ndarray:
-        return (self.forward(X) > 0.5).astype(int)
+        A = self.forward(X)
+        if self.num_classes == 1:
+            return (A > 0.5).astype(int)
+        else:
+            return np.argmax(A, axis=0)
 
     def train(self, X: np.ndarray, Y: np.ndarray, epochs: int, batch_size: int = 32) -> List[float]:
         m = X.shape[1]
@@ -125,7 +151,7 @@ class NNetwork:
                 grads = self.backward(Y_batch)
                 self.optimizer_step(grads)
                 
-                batch_loss = -np.mean(Y_batch * np.log(A) + (1 - Y_batch) * np.log(1 - A))
+                batch_loss = self.calculate_loss(Y_batch, A)
                 epoch_loss += batch_loss * X_batch.shape[1]
             
             epoch_loss /= m
